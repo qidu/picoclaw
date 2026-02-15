@@ -12,13 +12,29 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/auth"
 	"github.com/sipeed/picoclaw/pkg/config"
 )
+
+// tcp4Resolver uses Google DNS (8.8.8.8) for lookups over IPv4
+func tcp4Resolver(ctx context.Context, network, address string) (net.Conn, error) {
+	d := net.Dialer{}
+	return d.DialContext(ctx, "tcp4", "8.8.8.8:53")
+}
+
+// resolveIPv4 resolves a hostname to IPv4 using Google DNS
+func resolveIPv4(ctx context.Context, host string) ([]net.IP, error) {
+	resolver := &net.Resolver{
+		Dial: tcp4Resolver,
+	}
+	return resolver.LookupIP(ctx, "ip", host)
+}
 
 type HTTPProvider struct {
 	apiKey     string
@@ -27,7 +43,37 @@ type HTTPProvider struct {
 }
 
 func NewHTTPProvider(apiKey, apiBase, proxy string) *HTTPProvider {
+	// Use a custom dialer that forces IPv4 for both DNS and connection
+	dialer := &net.Dialer{}
+
 	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				// Parse host:port
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return dialer.DialContext(ctx, "tcp4", addr)
+				}
+
+				// Resolve hostname to IPv4 using Google DNS
+				ips, err := resolveIPv4(ctx, host)
+				if err != nil || len(ips) == 0 {
+					// Fallback: try direct IPv4 connection
+					return dialer.DialContext(ctx, "tcp4", addr)
+				}
+
+				// Use first IPv4 address
+				for _, ip := range ips {
+					if ip.To4() != nil {
+						return dialer.DialContext(ctx, "tcp4", net.JoinHostPort(ip.String(), port))
+					}
+				}
+
+				return dialer.DialContext(ctx, "tcp4", addr)
+			},
+			MaxIdleConns:    100,
+			IdleConnTimeout: 90 * time.Second,
+		},
 		Timeout: 0,
 	}
 
@@ -35,7 +81,10 @@ func NewHTTPProvider(apiKey, apiBase, proxy string) *HTTPProvider {
 		proxyURL, err := url.Parse(proxy)
 		if err == nil {
 			client.Transport = &http.Transport{
-				Proxy: http.ProxyURL(proxyURL),
+				Proxy:           http.ProxyURL(proxyURL),
+				DialContext:     nil,
+				MaxIdleConns:    100,
+				IdleConnTimeout: 90 * time.Second,
 			}
 		}
 	}
