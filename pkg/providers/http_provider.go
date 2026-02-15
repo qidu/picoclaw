@@ -15,12 +15,18 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/sipeed/picoclaw/pkg/auth"
 	"github.com/sipeed/picoclaw/pkg/config"
 )
+
+// isTermux returns true if running in Termux environment
+func isTermux() bool {
+	return strings.Contains(os.Getenv("PREFIX"), "com.termux")
+}
 
 // tcp4Resolver uses Google DNS (8.8.8.8) for lookups over IPv4
 func tcp4Resolver(ctx context.Context, network, address string) (net.Conn, error) {
@@ -43,34 +49,63 @@ type HTTPProvider struct {
 }
 
 func NewHTTPProvider(apiKey, apiBase, proxy string) *HTTPProvider {
-	// Use a custom dialer that forces IPv4 for both DNS and connection
 	dialer := &net.Dialer{}
 
+	// Use IPv4-only on Termux (for Android compatibility), default elsewhere
+	if isTermux() {
+		client := &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					// Parse host:port
+					host, port, err := net.SplitHostPort(addr)
+					if err != nil {
+						return dialer.DialContext(ctx, "tcp4", addr)
+					}
+
+					// Resolve hostname to IPv4 using Google DNS
+					ips, err := resolveIPv4(ctx, host)
+					if err != nil || len(ips) == 0 {
+						// Fallback: try direct IPv4 connection
+						return dialer.DialContext(ctx, "tcp4", addr)
+					}
+
+					// Use first IPv4 address
+					for _, ip := range ips {
+						if ip.To4() != nil {
+							return dialer.DialContext(ctx, "tcp4", net.JoinHostPort(ip.String(), port))
+						}
+					}
+
+					return dialer.DialContext(ctx, "tcp4", addr)
+				},
+				MaxIdleConns:    100,
+				IdleConnTimeout: 90 * time.Second,
+			},
+			Timeout: 0,
+		}
+
+		if proxy != "" {
+			proxyURL, err := url.Parse(proxy)
+			if err == nil {
+				client.Transport = &http.Transport{
+					Proxy:           http.ProxyURL(proxyURL),
+					DialContext:     nil,
+					MaxIdleConns:    100,
+					IdleConnTimeout: 90 * time.Second,
+				}
+			}
+		}
+
+		return &HTTPProvider{
+			apiKey:     apiKey,
+			apiBase:    strings.TrimRight(apiBase, "/"),
+			httpClient: client,
+		}
+	}
+
+	// Default behavior for non-Termux machines
 	client := &http.Client{
 		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				// Parse host:port
-				host, port, err := net.SplitHostPort(addr)
-				if err != nil {
-					return dialer.DialContext(ctx, "tcp4", addr)
-				}
-
-				// Resolve hostname to IPv4 using Google DNS
-				ips, err := resolveIPv4(ctx, host)
-				if err != nil || len(ips) == 0 {
-					// Fallback: try direct IPv4 connection
-					return dialer.DialContext(ctx, "tcp4", addr)
-				}
-
-				// Use first IPv4 address
-				for _, ip := range ips {
-					if ip.To4() != nil {
-						return dialer.DialContext(ctx, "tcp4", net.JoinHostPort(ip.String(), port))
-					}
-				}
-
-				return dialer.DialContext(ctx, "tcp4", addr)
-			},
 			MaxIdleConns:    100,
 			IdleConnTimeout: 90 * time.Second,
 		},
@@ -82,7 +117,6 @@ func NewHTTPProvider(apiKey, apiBase, proxy string) *HTTPProvider {
 		if err == nil {
 			client.Transport = &http.Transport{
 				Proxy:           http.ProxyURL(proxyURL),
-				DialContext:     nil,
 				MaxIdleConns:    100,
 				IdleConnTimeout: 90 * time.Second,
 			}
