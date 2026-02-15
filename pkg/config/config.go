@@ -157,17 +157,18 @@ type DevicesConfig struct {
 }
 
 type ProvidersConfig struct {
-	Anthropic    ProviderConfig `json:"anthropic"`
-	OpenAI       ProviderConfig `json:"openai"`
-	OpenRouter   ProviderConfig `json:"openrouter"`
-	Groq         ProviderConfig `json:"groq"`
-	Zhipu        ProviderConfig `json:"zhipu"`
-	VLLM         ProviderConfig `json:"vllm"`
-	Gemini       ProviderConfig `json:"gemini"`
-	Nvidia       ProviderConfig `json:"nvidia"`
-	Moonshot     ProviderConfig `json:"moonshot"`
-	ShengSuanYun ProviderConfig `json:"shengsuanyun"`
-	DeepSeek     ProviderConfig `json:"deepseek"`
+	Anthropic       ProviderConfig            `json:"anthropic"`
+	OpenAI          ProviderConfig            `json:"openai"`
+	OpenRouter      ProviderConfig            `json:"openrouter"`
+	Groq            ProviderConfig            `json:"groq"`
+	Zhipu           ProviderConfig            `json:"zhipu"`
+	VLLM            ProviderConfig            `json:"vllm"`
+	Gemini          ProviderConfig            `json:"gemini"`
+	Nvidia          ProviderConfig            `json:"nvidia"`
+	Moonshot        ProviderConfig            `json:"moonshot"`
+	ShengSuanYun    ProviderConfig            `json:"shengsuanyun"`
+	DeepSeek        ProviderConfig            `json:"deepseek"`
+	CustomProviders map[string]ProviderConfig `json:"custom,omitempty"`
 }
 
 type ProviderConfig struct {

@@ -397,6 +397,14 @@ func CreateProvider(cfg *config.Config) (LLMProvider, error) {
 					model = "deepseek-chat"
 				}
 			}
+
+		// Custom provider (user-defined in config)
+		default:
+			if customCfg, ok := cfg.Providers.CustomProviders[providerName]; ok {
+				apiKey = customCfg.APIKey
+				apiBase = customCfg.APIBase
+				proxy = customCfg.Proxy
+			}
 		}
 	}
 
@@ -479,17 +487,33 @@ func CreateProvider(cfg *config.Config) (LLMProvider, error) {
 			apiBase = cfg.Providers.VLLM.APIBase
 			proxy = cfg.Providers.VLLM.Proxy
 
+		// Auto-detect custom provider from model name (e.g., "sufy/llama-3.1")
 		default:
-			if cfg.Providers.OpenRouter.APIKey != "" {
-				apiKey = cfg.Providers.OpenRouter.APIKey
-				proxy = cfg.Providers.OpenRouter.Proxy
-				if cfg.Providers.OpenRouter.APIBase != "" {
-					apiBase = cfg.Providers.OpenRouter.APIBase
-				} else {
-					apiBase = "https://openrouter.ai/api/v1"
+			// Check if model has provider prefix (e.g., "sufy/model-name")
+			if idx := strings.Index(model, "/"); idx != -1 {
+				customProviderName := strings.ToLower(model[:idx])
+				if customCfg, ok := cfg.Providers.CustomProviders[customProviderName]; ok {
+					apiKey = customCfg.APIKey
+					apiBase = customCfg.APIBase
+					proxy = customCfg.Proxy
+					// Strip provider prefix from model
+					model = model[idx+1:]
 				}
-			} else {
-				return nil, fmt.Errorf("no API key configured for model: %s", model)
+			}
+
+			// Fallback to OpenRouter if still no config
+			if apiKey == "" && apiBase == "" {
+				if cfg.Providers.OpenRouter.APIKey != "" {
+					apiKey = cfg.Providers.OpenRouter.APIKey
+					proxy = cfg.Providers.OpenRouter.Proxy
+					if cfg.Providers.OpenRouter.APIBase != "" {
+						apiBase = cfg.Providers.OpenRouter.APIBase
+					} else {
+						apiBase = "https://openrouter.ai/api/v1"
+					}
+				} else {
+					return nil, fmt.Errorf("no API key configured for model: %s", model)
+				}
 			}
 		}
 	}
