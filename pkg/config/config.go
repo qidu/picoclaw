@@ -168,14 +168,40 @@ type ProvidersConfig struct {
 	Moonshot        ProviderConfig            `json:"moonshot"`
 	ShengSuanYun    ProviderConfig            `json:"shengsuanyun"`
 	DeepSeek        ProviderConfig            `json:"deepseek"`
-	CustomProviders map[string]ProviderConfig `json:"custom,omitempty"`
+	CustomProviders map[string]CustomProviderConfig `json:"custom,omitempty"`
 }
 
 type ProviderConfig struct {
-	APIKey     string `json:"api_key" env:"PICOCLAW_PROVIDERS_{{.Name}}_API_KEY"`
-	APIBase    string `json:"api_base" env:"PICOCLAW_PROVIDERS_{{.Name}}_API_BASE"`
-	Proxy      string `json:"proxy,omitempty" env:"PICOCLAW_PROVIDERS_{{.Name}}_PROXY"`
-	AuthMethod string `json:"auth_method,omitempty" env:"PICOCLAW_PROVIDERS_{{.Name}}_AUTH_METHOD"`
+	APIKey      string `json:"api_key" env:"PICOCLAW_PROVIDERS_{{.Name}}_API_KEY"`
+	APIBase     string `json:"api_base" env:"PICOCLAW_PROVIDERS_{{.Name}}_API_BASE"`
+	Proxy       string `json:"proxy,omitempty" env:"PICOCLAW_PROVIDERS_{{.Name}}_PROXY"`
+	AuthMethod  string `json:"auth_method,omitempty" env:"PICOCLAW_PROVIDERS_{{.Name}}_AUTH_METHOD"`
+	APIFormat   string `json:"api_format,omitempty"`          // "openai", "anthropic", "custom"
+	AuthHeader  string `json:"auth_header,omitempty"`         // Authorization header name
+	AuthPrefix  string `json:"auth_prefix,omitempty"`         // e.g., "Bearer", "Api-Key"
+	Endpoint    string `json:"endpoint,omitempty"`            // Custom endpoint suffix (default: /chat/completions)
+	MaxTokensField string `json:"max_tokens_field,omitempty"` // Field name for max tokens
+}
+
+// CustomProviderConfig allows more flexible provider configuration
+type CustomProviderConfig struct {
+	APIKey       string            `json:"api_key,omitempty"`
+	APIBase      string            `json:"api_base"`
+	Proxy        string            `json:"proxy,omitempty"`
+	APIFormat    string            `json:"api_format,omitempty"` // "openai", "anthropic", "custom"
+	AuthHeader   string            `json:"auth_header,omitempty"`
+	AuthPrefix   string            `json:"auth_prefix,omitempty"`
+	Endpoint     string            `json:"endpoint,omitempty"`
+	RequestMap   map[string]string `json:"request_map,omitempty"`   // JSON field mappings
+	ResponseMap  ResponseMapConfig `json:"response_map,omitempty"`  // Response field mappings
+}
+
+type ResponseMapConfig struct {
+	Content   string `json:"content,omitempty"`   // Path to content, e.g., "choices.0.message.content"
+	Role      string `json:"role,omitempty"`      // Path to role
+	ToolCalls string `json:"tool_calls,omitempty"` // Path to tool calls
+	FinishReason string `json:"finish_reason,omitempty"` // Path to finish reason
+	Usage     string `json:"usage,omitempty"`     // Path to usage
 }
 
 type GatewayConfig struct {

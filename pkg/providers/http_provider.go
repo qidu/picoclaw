@@ -48,72 +48,86 @@ type HTTPProvider struct {
 	httpClient *http.Client
 }
 
+// ProviderInfo holds the configuration for making API requests
+type ProviderInfo struct {
+	APIKey        string
+	APIBase       string
+	Proxy         string
+	APIFormat     string // "openai", "anthropic", "custom"
+	AuthHeader    string // Custom auth header name (default: "Authorization")
+	AuthPrefix    string // Auth header prefix (default: "Bearer")
+	Endpoint      string // Custom endpoint (default: "/chat/completions")
+	RequestMap    map[string]string
+	ResponseMap   ResponseMapConfig
+}
+
+// ResponseMapConfig defines custom response field mappings
+type ResponseMapConfig = config.ResponseMapConfig
+
+// ResponseMapConfigFields for internal use
+type ResponseMapConfigFields struct {
+	Content      string
+	Role         string
+	ToolCalls    string
+	FinishReason string
+	Usage        string
+}
+
 func NewHTTPProvider(apiKey, apiBase, proxy string) *HTTPProvider {
+	return NewHTTPProviderWithConfig(ProviderInfo{
+		APIKey:     apiKey,
+		APIBase:    strings.TrimRight(apiBase, "/"),
+		Proxy:      proxy,
+		APIFormat:  "openai",
+		AuthHeader: "Authorization",
+		AuthPrefix: "Bearer",
+		Endpoint:   "/chat/completions",
+	})
+}
+
+// NewHTTPProviderWithConfig creates an HTTPProvider with extended configuration
+func NewHTTPProviderWithConfig(info ProviderInfo) *HTTPProvider {
 	dialer := &net.Dialer{}
 
-	// Use IPv4-only on Termux (for Android compatibility), default elsewhere
+	var transport *http.Transport
+
+	// Use IPv4-only on Termux for compatibility
 	if isTermux() {
-		client := &http.Client{
-			Transport: &http.Transport{
-				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					// Parse host:port
-					host, port, err := net.SplitHostPort(addr)
-					if err != nil {
-						return dialer.DialContext(ctx, "tcp4", addr)
-					}
-
-					// Resolve hostname to IPv4 using Google DNS
-					ips, err := resolveIPv4(ctx, host)
-					if err != nil || len(ips) == 0 {
-						// Fallback: try direct IPv4 connection
-						return dialer.DialContext(ctx, "tcp4", addr)
-					}
-
-					// Use first IPv4 address
-					for _, ip := range ips {
-						if ip.To4() != nil {
-							return dialer.DialContext(ctx, "tcp4", net.JoinHostPort(ip.String(), port))
-						}
-					}
-
+		transport = &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
 					return dialer.DialContext(ctx, "tcp4", addr)
-				},
-				MaxIdleConns:    100,
-				IdleConnTimeout: 90 * time.Second,
-			},
-			Timeout: 0,
-		}
-
-		if proxy != "" {
-			proxyURL, err := url.Parse(proxy)
-			if err == nil {
-				client.Transport = &http.Transport{
-					Proxy:           http.ProxyURL(proxyURL),
-					DialContext:     nil,
-					MaxIdleConns:    100,
-					IdleConnTimeout: 90 * time.Second,
 				}
-			}
-		}
-
-		return &HTTPProvider{
-			apiKey:     apiKey,
-			apiBase:    strings.TrimRight(apiBase, "/"),
-			httpClient: client,
-		}
-	}
-
-	// Default behavior for non-Termux machines
-	client := &http.Client{
-		Transport: &http.Transport{
+				ips, err := resolveIPv4(ctx, host)
+				if err != nil || len(ips) == 0 {
+					return dialer.DialContext(ctx, "tcp4", addr)
+				}
+				for _, ip := range ips {
+					if ip.To4() != nil {
+						return dialer.DialContext(ctx, "tcp4", net.JoinHostPort(ip.String(), port))
+					}
+				}
+				return dialer.DialContext(ctx, "tcp4", addr)
+			},
 			MaxIdleConns:    100,
 			IdleConnTimeout: 90 * time.Second,
-		},
-		Timeout: 0,
+		}
+	} else {
+		// Standard transport for non-Termux
+		transport = &http.Transport{
+			MaxIdleConns:    100,
+			IdleConnTimeout: 90 * time.Second,
+		}
 	}
 
-	if proxy != "" {
-		proxyURL, err := url.Parse(proxy)
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   0,
+	}
+
+	if info.Proxy != "" {
+		proxyURL, err := url.Parse(info.Proxy)
 		if err == nil {
 			client.Transport = &http.Transport{
 				Proxy:           http.ProxyURL(proxyURL),
@@ -124,8 +138,8 @@ func NewHTTPProvider(apiKey, apiBase, proxy string) *HTTPProvider {
 	}
 
 	return &HTTPProvider{
-		apiKey:     apiKey,
-		apiBase:    strings.TrimRight(apiBase, "/"),
+		apiKey:     info.APIKey,
+		apiBase:    info.APIBase,
 		httpClient: client,
 	}
 }
@@ -526,5 +540,33 @@ func CreateProvider(cfg *config.Config) (LLMProvider, error) {
 		return nil, fmt.Errorf("no API base configured for provider (model: %s)", model)
 	}
 
-	return NewHTTPProvider(apiKey, apiBase, proxy), nil
+	// Build provider info with extended config
+	providerInfo := ProviderInfo{
+		APIKey:      apiKey,
+		APIBase:     strings.TrimRight(apiBase, "/"),
+		Proxy:       proxy,
+		APIFormat:   "openai",
+		AuthHeader:  "Authorization",
+		AuthPrefix:  "Bearer",
+		Endpoint:    "/chat/completions",
+		ResponseMap: ResponseMapConfig{},
+	}
+
+	// Check if this is a custom provider with extended config
+	if customCfg, ok := cfg.Providers.CustomProviders[providerName]; ok {
+		providerInfo.APIKey = customCfg.APIKey
+		providerInfo.APIBase = strings.TrimRight(customCfg.APIBase, "/")
+		providerInfo.Proxy = customCfg.Proxy
+		providerInfo.APIFormat = customCfg.APIFormat
+		providerInfo.AuthHeader = customCfg.AuthHeader
+		providerInfo.AuthPrefix = customCfg.AuthPrefix
+		providerInfo.Endpoint = customCfg.Endpoint
+		if providerInfo.Endpoint == "" {
+			providerInfo.Endpoint = "/chat/completions"
+		}
+		providerInfo.RequestMap = customCfg.RequestMap
+		providerInfo.ResponseMap = customCfg.ResponseMap
+	}
+
+	return NewHTTPProviderWithConfig(providerInfo), nil
 }
