@@ -3,7 +3,8 @@
     "defaults": {
       "workspace": "~/.picoclaw/workspace",
       "restrict_to_workspace": true,
-      "model": "glm-4.7",
+      "provider": "",
+      "model": "qnaigc/minimax-m2.5",
       "max_tokens": 8192,
       "temperature": 0.7,
       "max_tool_iterations": 20
@@ -99,6 +100,13 @@
     "moonshot": {
       "api_key": "sk-xxx",
       "api_base": ""
+    },
+    "custom": {
+      "qnaigc": {
+        "api_key": "sk-6cee1235ef03cde0cf634d9dfb70e0eb58a6770ef189417f51eacfec98ba717a",
+        "api_base": "https://api.qnaigc.com/v1",
+        "api_format": "openai"
+      }
     }
   },
   "tools": {
