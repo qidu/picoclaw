@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 
 	"github.com/caarlos0/env/v11"
@@ -152,8 +153,237 @@ type HeartbeatConfig struct {
 }
 
 type DevicesConfig struct {
-	Enabled    bool `json:"enabled" env:"PICOCLAW_DEVICES_ENABLED"`
-	MonitorUSB bool `json:"monitor_usb" env:"PICOCLAW_DEVICES_MONITOR_USB"`
+	Enabled     bool                  `json:"enabled" env:"PICOCLAW_DEVICES_ENABLED"`
+	MonitorUSB  bool                  `json:"monitor_usb" env:"PICOCLAW_DEVICES_MONITOR_USB"`
+	DeviceType  string                `json:"device_type" env:"PICOCLAW_DEVICES_DEVICE_TYPE"` // auto, pi-zero, pi-3, pi-4, phone-8, desktop, server
+	Lanes       LanesConfig           `json:"lanes"`
+}
+
+type LanesConfig struct {
+	Heartbeat  LaneProfileConfig `json:"heartbeat"`
+	Default    LaneProfileConfig `json:"default"`
+	Subagent   LaneProfileConfig `json:"subagent"`
+	Background LaneProfileConfig `json:"background"`
+	Broadcast  LaneProfileConfig `json:"broadcast"`
+}
+
+type LaneProfileConfig struct {
+	Priority      int `json:"priority"`
+	MaxConcurrent int `json:"max_concurrent"`
+	QueueSize     int `json:"queue_size"`
+}
+
+// DeviceProfile represents lane configuration for a specific device type.
+type DeviceProfile struct {
+	Name            string
+	CPUCores        int
+	RAMGB           int
+	HeartbeatMax    int
+	DefaultMax      int
+	SubagentMax     int
+	BackgroundMax   int
+	BroadcastMax    int
+	HeartbeatPri    int
+	DefaultPri      int
+	SubagentPri     int
+	BackgroundPri   int
+	BroadcastPri    int
+}
+
+// Predefined device profiles (OpenClaw-inspired but simplified)
+var DeviceProfiles = map[string]DeviceProfile{
+	"pi-zero": {
+		Name:          "Raspberry Pi Zero",
+		CPUCores:      1,
+		RAMGB:         1, // Minimum 1GB for Go runtime
+		HeartbeatMax:  1,
+		DefaultMax:    1,
+		SubagentMax:   2,
+		BackgroundMax: 2,
+		BroadcastMax:  2,
+		HeartbeatPri:  100,
+		DefaultPri:    50,
+		SubagentPri:   25,
+		BackgroundPri: 10,
+	},
+	"pi-3": {
+		Name:          "Raspberry Pi 3",
+		CPUCores:      4,
+		RAMGB:         1,
+		HeartbeatMax:  1,
+		DefaultMax:    2,
+		SubagentMax:   4,
+		BackgroundMax: 5,
+		BroadcastMax:  5,
+		HeartbeatPri:  100,
+		DefaultPri:    50,
+		SubagentPri:   25,
+		BackgroundPri: 10,
+	},
+	"pi-4": {
+		Name:          "Raspberry Pi 4",
+		CPUCores:      4,
+		RAMGB:         4,
+		HeartbeatMax:  1,
+		DefaultMax:    3,
+		SubagentMax:   5,
+		BackgroundMax: 8,
+		BroadcastMax:  10,
+		HeartbeatPri:  100,
+		DefaultPri:    50,
+		SubagentPri:   25,
+		BackgroundPri: 10,
+	},
+	"phone-8": {
+		Name:          "8-Core Phone",
+		CPUCores:      8,
+		RAMGB:         8,
+		HeartbeatMax:  1,
+		DefaultMax:    5,
+		SubagentMax:   8,
+		BackgroundMax: 12,
+		BroadcastMax:  15,
+		HeartbeatPri:  100,
+		DefaultPri:    50,
+		SubagentPri:   25,
+		BackgroundPri: 10,
+	},
+	"desktop": {
+		Name:          "Desktop PC",
+		CPUCores:      8,
+		RAMGB:         16,
+		HeartbeatMax:  1,
+		DefaultMax:    10,
+		SubagentMax:   20,
+		BackgroundMax: 30,
+		BroadcastMax:  50,
+		HeartbeatPri:  100,
+		DefaultPri:    50,
+		SubagentPri:   25,
+		BackgroundPri: 10,
+	},
+	"server": {
+		Name:          "Server",
+		CPUCores:      32,
+		RAMGB:         64,
+		HeartbeatMax:  1,
+		DefaultMax:    50,
+		SubagentMax:   100,
+		BackgroundMax: 200,
+		BroadcastMax:  500,
+		HeartbeatPri:  100,
+		DefaultPri:    50,
+		SubagentPri:   25,
+		BackgroundPri: 10,
+	},
+}
+
+// DetectDeviceProfile auto-detects the device type based on system capabilities.
+func DetectDeviceProfile() DeviceProfile {
+	// Try to detect CPU cores and memory
+	cpuCores := runtime.NumCPU()
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	ramGB := int(memStats.TotalAlloc / (1024 * 1024 * 1024))
+	if ramGB < 1 {
+		ramGB = 1 // Minimum 1GB for Go runtime
+	}
+
+	// Map detected specs to profile
+	switch {
+	case cpuCores <= 1 && ramGB <= 1:
+		return DeviceProfiles["pi-zero"]
+	case cpuCores <= 2 && ramGB <= 2:
+		return DeviceProfiles["pi-3"]
+	case cpuCores <= 4 && ramGB <= 4:
+		return DeviceProfiles["pi-4"]
+	case cpuCores <= 8 && ramGB <= 8:
+		// Phone or desktop - assume phone by default for mobile use case
+		if ramGB <= 8 {
+			return DeviceProfiles["phone-8"]
+		}
+		return DeviceProfiles["desktop"]
+	case cpuCores <= 16 && ramGB <= 16:
+		return DeviceProfiles["desktop"]
+	default:
+		return DeviceProfiles["server"]
+	}
+}
+
+// GetLaneConfig returns lane configuration for the configured device.
+func (c *Config) GetLaneConfig() LanesConfig {
+	if c.Devices.DeviceType == "auto" {
+		profile := DetectDeviceProfile()
+		return LanesConfig{
+			Heartbeat: LaneProfileConfig{
+				Priority:      profile.HeartbeatPri,
+				MaxConcurrent: profile.HeartbeatMax,
+				QueueSize:     10,
+			},
+			Default: LaneProfileConfig{
+				Priority:      profile.DefaultPri,
+				MaxConcurrent: profile.DefaultMax,
+				QueueSize:     50,
+			},
+			Subagent: LaneProfileConfig{
+				Priority:      profile.SubagentPri,
+				MaxConcurrent: profile.SubagentMax,
+				QueueSize:     100,
+			},
+			Background: LaneProfileConfig{
+				Priority:      profile.BackgroundPri,
+				MaxConcurrent: profile.BackgroundMax,
+				QueueSize:     100,
+			},
+			Broadcast: LaneProfileConfig{
+				Priority:      1,
+				MaxConcurrent: profile.BroadcastMax,
+				QueueSize:     1000,
+			},
+		}
+	}
+
+	// Use explicit config
+	return c.Devices.Lanes
+}
+
+// ApplyDeviceProfile applies a predefined device profile to the config.
+func (c *Config) ApplyDeviceProfile(profileName string) error {
+	profile, ok := DeviceProfiles[profileName]
+	if !ok {
+		return fmt.Errorf("unknown device profile: %s", profileName)
+	}
+
+	c.Devices.DeviceType = profileName
+	c.Devices.Lanes = LanesConfig{
+		Heartbeat: LaneProfileConfig{
+			Priority:      profile.HeartbeatPri,
+			MaxConcurrent: profile.HeartbeatMax,
+			QueueSize:     10,
+		},
+		Default: LaneProfileConfig{
+			Priority:      profile.DefaultPri,
+			MaxConcurrent: profile.DefaultMax,
+			QueueSize:     50,
+		},
+		Subagent: LaneProfileConfig{
+			Priority:      profile.SubagentPri,
+			MaxConcurrent: profile.SubagentMax,
+			QueueSize:     100,
+		},
+		Background: LaneProfileConfig{
+			Priority:      profile.BackgroundPri,
+			MaxConcurrent: profile.BackgroundMax,
+			QueueSize:     100,
+		},
+		Broadcast: LaneProfileConfig{
+			Priority:      1,
+			MaxConcurrent: profile.BroadcastMax,
+			QueueSize:     1000,
+		},
+	}
+
+	return nil
 }
 
 type ProvidersConfig struct {
@@ -336,6 +566,8 @@ func DefaultConfig() *Config {
 		Devices: DevicesConfig{
 			Enabled:    false,
 			MonitorUSB: true,
+			DeviceType: "auto",
+			Lanes:      LanesConfig{},
 		},
 	}
 }
