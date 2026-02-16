@@ -30,14 +30,22 @@ func isTermux() bool {
 
 // tcp4Resolver uses Google DNS (8.8.8.8) for lookups over IPv4
 func tcp4Resolver(ctx context.Context, network, address string) (net.Conn, error) {
-	d := net.Dialer{}
+	d := &net.Dialer{
+		Timeout: 5 * time.Second,
+	}
 	return d.DialContext(ctx, "tcp4", "8.8.8.8:53")
 }
 
 // resolveIPv4 resolves a hostname to IPv4 using Google DNS
 func resolveIPv4(ctx context.Context, host string) ([]net.IP, error) {
 	resolver := &net.Resolver{
-		Dial: tcp4Resolver,
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := &net.Dialer{
+				Timeout: 5 * time.Second,
+			}
+			return d.DialContext(ctx, "tcp4", "8.8.8.8:53")
+		},
 	}
 	return resolver.LookupIP(ctx, "ip", host)
 }
