@@ -503,15 +503,15 @@ func CreateProvider(cfg *config.Config) (LLMProvider, error) {
 
 		// Auto-detect custom provider from model name (e.g., "sufy/llama-3.1")
 		default:
-			// Check if model has provider prefix (e.g., "sufy/model-name")
+			// Check if model has provider prefix (e.g., "sufy/model-name" or "qnaigc/minimax-m2.5")
 			if idx := strings.Index(model, "/"); idx != -1 {
 				customProviderName := strings.ToLower(model[:idx])
 				if customCfg, ok := cfg.Providers.CustomProviders[customProviderName]; ok {
 					apiKey = customCfg.APIKey
 					apiBase = customCfg.APIBase
 					proxy = customCfg.Proxy
-					// Strip provider prefix from model
-					model = model[idx+1:]
+					// DON'T strip provider prefix - the model ID may already contain it (e.g., "minimax/minimax-m2.5")
+					// Keep the full model name as-is
 				}
 			}
 
