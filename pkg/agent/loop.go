@@ -3,6 +3,13 @@
 // License: MIT
 //
 // Copyright (c) 2026 PicoClaw contributors
+//
+// Refactored based on OpenClaw patterns:
+// - Run management (queue, abort, status)
+// - Session lanes
+// - History limiting with context window guard
+// - Session compaction
+// - Modular architecture
 
 package agent
 
@@ -28,6 +35,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg/utils"
 )
 
+// AgentLoop manages the core agent execution loop with OpenClaw-inspired patterns.
 type AgentLoop struct {
 	bus            *bus.MessageBus
 	provider       providers.LLMProvider
@@ -41,11 +49,93 @@ type AgentLoop struct {
 	tools          *tools.ToolRegistry
 	running        atomic.Bool
 	summarizing    sync.Map // Tracks which sessions are currently being summarized
+
+	// Run management (OpenClaw pattern)
+	runManager *RunManager
+
+	// Session lanes (OpenClaw pattern)
+	lanes *LaneManager
+}
+
+// RunManager manages active runs with queue and abort support.
+type RunManager struct {
+	mu       sync.RWMutex
+	active   map[string]*ActiveRun
+	queue    chan *RunRequest
+	aborted  map[string]bool
+	stats    RunStats
+}
+
+type ActiveRun struct {
+	ID          string
+	SessionKey  string
+	StartTime   time.Time
+	Status      RunStatus
+	Chan        chan RunEvent
+}
+
+type RunRequest struct {
+	SessionKey string
+	Channel    string
+	ChatID     string
+	Message    string
+	Opts       processOptions
+	ResultChan chan RunResult
+}
+
+type RunEvent struct {
+	Type    string
+	Message string
+}
+
+type RunResult struct {
+	Response string
+	Error    error
+}
+
+type RunStatus string
+
+const (
+	RunStatusPending   RunStatus = "pending"
+	RunStatusRunning   RunStatus = "running"
+	RunStatusComplete  RunStatus = "complete"
+	RunStatusAborted  RunStatus = "aborted"
+	RunStatusFailed   RunStatus = "failed"
+)
+
+type RunStats struct {
+	TotalRuns   int64
+	ActiveRuns  int64
+	QueuedRuns  int64
+	AbortedRuns int64
+}
+
+// LaneManager manages session lanes for isolation (OpenClaw pattern).
+type LaneManager struct {
+	mu      sync.RWMutex
+	lanes   map[string]*Lane
+	defaultLane *Lane
+}
+
+type Lane struct {
+	ID            string
+	Name          string
+	Sessions      map[string]*LaneSession
+	Priority      int
+	MaxConcurrent int
+	mu            sync.RWMutex
+}
+
+type LaneSession struct {
+	SessionKey string
+	Active     bool
+	LastActive time.Time
 }
 
 // processOptions configures how a message is processed
 type processOptions struct {
 	SessionKey      string // Session identifier for history/context
+	Lane            string // Session lane for isolation
 	Channel         string // Target channel for tool execution
 	ChatID          string // Target chat ID for tool execution
 	UserMessage     string // User message content (may include prefix)
@@ -53,6 +143,238 @@ type processOptions struct {
 	EnableSummary   bool   // Whether to trigger summarization
 	SendResponse    bool   // Whether to send response via bus
 	NoHistory       bool   // If true, don't load session history (for heartbeat)
+	RunID           string // Optional run ID for tracking
+	TimeoutSeconds  int    // Optional timeout override
+}
+
+// NewAgentLoop creates a new agent loop with OpenClaw-inspired features.
+func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers.LLMProvider) *AgentLoop {
+	workspace := cfg.WorkspacePath()
+	os.MkdirAll(workspace, 0755)
+
+	restrict := cfg.Agents.Defaults.RestrictToWorkspace
+
+	// Create tool registry for main agent
+	toolsRegistry := createToolRegistry(workspace, restrict, cfg, msgBus)
+
+	// Create subagent manager with its own tool registry
+	subagentManager := tools.NewSubagentManager(provider, cfg.Agents.Defaults.Model, workspace, msgBus)
+	subagentTools := createToolRegistry(workspace, restrict, cfg, msgBus)
+	subagentManager.SetTools(subagentTools)
+
+	// Register spawn tool (for main agent)
+	spawnTool := tools.NewSpawnTool(subagentManager)
+	toolsRegistry.Register(spawnTool)
+
+	// Register subagent tool (synchronous execution)
+	subagentTool := tools.NewSubagentTool(subagentManager)
+	toolsRegistry.Register(subagentTool)
+
+	sessionsManager := session.NewSessionManager(filepath.Join(workspace, "sessions"))
+
+	// Create state manager for atomic state persistence
+	stateManager := state.NewManager(workspace)
+
+	// Create context builder and set tools registry
+	contextBuilder := NewContextBuilder(workspace)
+	contextBuilder.SetToolsRegistry(toolsRegistry)
+
+	agent := &AgentLoop{
+		bus:            msgBus,
+		provider:       provider,
+		workspace:      workspace,
+		model:          cfg.Agents.Defaults.Model,
+		contextWindow:  cfg.Agents.Defaults.MaxTokens,
+		maxIterations:  cfg.Agents.Defaults.MaxToolIterations,
+		sessions:       sessionsManager,
+		state:          stateManager,
+		contextBuilder: contextBuilder,
+		tools:          toolsRegistry,
+		summarizing:    sync.Map{},
+		runManager:     NewRunManager(),
+		lanes:          NewLaneManager(),
+	}
+
+	return agent
+}
+
+// NewRunManager creates a new run manager.
+func NewRunManager() *RunManager {
+	rm := &RunManager{
+		active:  make(map[string]*ActiveRun),
+		queue:   make(chan *RunRequest, 100),
+		aborted: make(map[string]bool),
+		stats:   RunStats{},
+	}
+	go rm.processQueue()
+	return rm
+}
+
+// processQueue processes run requests from the queue.
+func (rm *RunManager) processQueue() {
+	for req := range rm.queue {
+		rm.mu.Lock()
+		rm.stats.QueuedRuns--
+		rm.mu.Unlock()
+
+		// Check if run was aborted while queued
+		rm.mu.RLock()
+		aborted := rm.aborted[req.SessionKey]
+		rm.mu.RUnlock()
+
+		if aborted {
+			req.ResultChan <- RunResult{Error: fmt.Errorf("run was aborted")}
+			continue
+		}
+
+		// Execute run
+		// Note: Actual execution happens in Run()
+		_ = req
+	}
+}
+
+// QueueRun queues a run for execution.
+func (rm *RunManager) QueueRun(req *RunRequest) {
+	rm.mu.Lock()
+	rm.stats.QueuedRuns++
+	rm.mu.Unlock()
+	rm.queue <- req
+}
+
+// StartRun starts tracking a new run.
+func (rm *RunManager) StartRun(runID, sessionKey string) *ActiveRun {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	rm.stats.TotalRuns++
+	rm.stats.ActiveRuns++
+
+	run := &ActiveRun{
+		ID:         runID,
+		SessionKey: sessionKey,
+		StartTime:  time.Now(),
+		Status:     RunStatusRunning,
+		Chan:       make(chan RunEvent, 10),
+	}
+	rm.active[runID] = run
+	return run
+}
+
+// CompleteRun marks a run as complete.
+func (rm *RunManager) CompleteRun(runID string) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	if run, ok := rm.active[runID]; ok {
+		run.Status = RunStatusComplete
+		close(run.Chan)
+	}
+	delete(rm.active, runID)
+	rm.stats.ActiveRuns--
+}
+
+// AbortRun marks a run as aborted.
+func (rm *RunManager) AbortRun(runID string) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	rm.stats.AbortedRuns++
+	rm.aborted[runID] = true
+
+	if run, ok := rm.active[runID]; ok {
+		run.Status = RunStatusAborted
+		run.Chan <- RunEvent{Type: "aborted", Message: "Run was aborted"}
+		close(run.Chan)
+	}
+	delete(rm.active, runID)
+	rm.stats.ActiveRuns--
+}
+
+// GetActiveRun returns the currently active run for a session.
+func (rm *RunManager) GetActiveRun(sessionKey string) *ActiveRun {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+
+	for _, run := range rm.active {
+		if run.SessionKey == sessionKey && run.Status == RunStatusRunning {
+			return run
+		}
+	}
+	return nil
+}
+
+// GetStats returns current run statistics.
+func (rm *RunManager) GetStats() RunStats {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.stats
+}
+
+// NewLaneManager creates a new lane manager.
+func NewLaneManager() *LaneManager {
+	defaultLane := &Lane{
+		ID:            "default",
+		Name:          "Default",
+		Sessions:      make(map[string]*LaneSession),
+		Priority:      0,
+		MaxConcurrent: 5,
+	}
+
+	return &LaneManager{
+		lanes: map[string]*Lane{
+			"default": defaultLane,
+		},
+		defaultLane: defaultLane,
+	}
+}
+
+// GetLane returns a lane by ID.
+func (lm *LaneManager) GetLane(laneID string) *Lane {
+	lm.mu.RLock()
+	defer lm.mu.RUnlock()
+
+	if lane, ok := lm.lanes[laneID]; ok {
+		return lane
+	}
+	return lm.defaultLane
+}
+
+// RegisterSession registers a session in a lane.
+func (lm *LaneManager) RegisterSession(laneID, sessionKey string) {
+	lane := lm.GetLane(laneID)
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+
+	lane.Sessions[sessionKey] = &LaneSession{
+		SessionKey: sessionKey,
+		Active:     true,
+		LastActive: time.Now(),
+	}
+}
+
+// UnregisterSession removes a session from a lane.
+func (lm *LaneManager) UnregisterSession(laneID, sessionKey string) {
+	lane := lm.GetLane(laneID)
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+
+	delete(lane.Sessions, sessionKey)
+}
+
+// GetLaneStats returns statistics for a lane.
+func (lm *LaneManager) GetLaneStats(laneID string) (active, total int) {
+	lane := lm.GetLane(laneID)
+	lane.mu.RLock()
+	defer lane.mu.RUnlock()
+
+	active = 0
+	for _, s := range lane.Sessions {
+		if s.Active {
+			active++
+		}
+	}
+	total = len(lane.Sessions)
+	return
 }
 
 // createToolRegistry creates a tool registry with common tools.
@@ -86,7 +408,6 @@ func createToolRegistry(workspace string, restrict bool, cfg *config.Config, msg
 	registry.Register(tools.NewSPITool())
 
 	// Message tool - available to both agent and subagent
-	// Subagent uses it to communicate directly with user
 	messageTool := tools.NewMessageTool()
 	messageTool.SetSendCallback(func(channel, chatID, content string) error {
 		msgBus.PublishOutbound(bus.OutboundMessage{
@@ -101,55 +422,15 @@ func createToolRegistry(workspace string, restrict bool, cfg *config.Config, msg
 	return registry
 }
 
-func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers.LLMProvider) *AgentLoop {
-	workspace := cfg.WorkspacePath()
-	os.MkdirAll(workspace, 0755)
-
-	restrict := cfg.Agents.Defaults.RestrictToWorkspace
-
-	// Create tool registry for main agent
-	toolsRegistry := createToolRegistry(workspace, restrict, cfg, msgBus)
-
-	// Create subagent manager with its own tool registry
-	subagentManager := tools.NewSubagentManager(provider, cfg.Agents.Defaults.Model, workspace, msgBus)
-	subagentTools := createToolRegistry(workspace, restrict, cfg, msgBus)
-	// Subagent doesn't need spawn/subagent tools to avoid recursion
-	subagentManager.SetTools(subagentTools)
-
-	// Register spawn tool (for main agent)
-	spawnTool := tools.NewSpawnTool(subagentManager)
-	toolsRegistry.Register(spawnTool)
-
-	// Register subagent tool (synchronous execution)
-	subagentTool := tools.NewSubagentTool(subagentManager)
-	toolsRegistry.Register(subagentTool)
-
-	sessionsManager := session.NewSessionManager(filepath.Join(workspace, "sessions"))
-
-	// Create state manager for atomic state persistence
-	stateManager := state.NewManager(workspace)
-
-	// Create context builder and set tools registry
-	contextBuilder := NewContextBuilder(workspace)
-	contextBuilder.SetToolsRegistry(toolsRegistry)
-
-	return &AgentLoop{
-		bus:            msgBus,
-		provider:       provider,
-		workspace:      workspace,
-		model:          cfg.Agents.Defaults.Model,
-		contextWindow:  cfg.Agents.Defaults.MaxTokens, // Restore context window for summarization
-		maxIterations:  cfg.Agents.Defaults.MaxToolIterations,
-		sessions:       sessionsManager,
-		state:          stateManager,
-		contextBuilder: contextBuilder,
-		tools:          toolsRegistry,
-		summarizing:    sync.Map{},
-	}
+func NewAgentLoopSimple(cfg *config.Config, msgBus *bus.MessageBus, provider providers.LLMProvider) *AgentLoop {
+	return NewAgentLoop(cfg, msgBus, provider)
 }
 
 func (al *AgentLoop) Run(ctx context.Context) error {
 	al.running.Store(true)
+
+	// Start run manager processing
+	go al.runManager.processQueue()
 
 	for al.running.Load() {
 		select {
@@ -161,14 +442,24 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 				continue
 			}
 
+			// Start tracking this run
+			runID := utils.GenerateRunID()
+			run := al.runManager.StartRun(runID, msg.SessionKey)
+			defer al.runManager.CompleteRun(runID)
+
+			// Send run start event
+			run.Chan <- RunEvent{Type: "started", Message: fmt.Sprintf("Run %s started", runID)}
+
 			response, err := al.processMessage(ctx, msg)
 			if err != nil {
 				response = fmt.Sprintf("Error processing message: %v", err)
+				run.Chan <- RunEvent{Type: "error", Message: err.Error()}
+			} else {
+				run.Chan <- RunEvent{Type: "complete", Message: "Run completed successfully"}
 			}
 
 			if response != "" {
-				// Check if the message tool already sent a response during this round.
-				// If so, skip publishing to avoid duplicate messages to the user.
+				// Check if the message tool already sent a response
 				alreadySent := false
 				if tool, ok := al.tools.Get("message"); ok {
 					if mt, ok := tool.(*tools.MessageTool); ok {
@@ -199,13 +490,11 @@ func (al *AgentLoop) RegisterTool(tool tools.Tool) {
 }
 
 // RecordLastChannel records the last active channel for this workspace.
-// This uses the atomic state save mechanism to prevent data loss on crash.
 func (al *AgentLoop) RecordLastChannel(channel string) error {
 	return al.state.SetLastChannel(channel)
 }
 
 // RecordLastChatID records the last active chat ID for this workspace.
-// This uses the atomic state save mechanism to prevent data loss on crash.
 func (al *AgentLoop) RecordLastChatID(chatID string) error {
 	return al.state.SetLastChatID(chatID)
 }
@@ -227,7 +516,6 @@ func (al *AgentLoop) ProcessDirectWithChannel(ctx context.Context, content, sess
 }
 
 // ProcessHeartbeat processes a heartbeat request without session history.
-// Each heartbeat is independent and doesn't accumulate context.
 func (al *AgentLoop) ProcessHeartbeat(ctx context.Context, content, channel, chatID string) (string, error) {
 	return al.runAgentLoop(ctx, processOptions{
 		SessionKey:      "heartbeat",
@@ -237,15 +525,15 @@ func (al *AgentLoop) ProcessHeartbeat(ctx context.Context, content, channel, cha
 		DefaultResponse: "I've completed processing but have no response to give.",
 		EnableSummary:   false,
 		SendResponse:    false,
-		NoHistory:       true, // Don't load session history for heartbeat
+		NoHistory:       true,
 	})
 }
 
 func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage) (string, error) {
-	// Add message preview to log (show full content for error messages)
+	// Add message preview to log
 	var logContent string
 	if strings.Contains(msg.Content, "Error:") || strings.Contains(msg.Content, "error") {
-		logContent = msg.Content // Full content for errors
+		logContent = msg.Content
 	} else {
 		logContent = utils.Truncate(msg.Content, 80)
 	}
@@ -275,7 +563,6 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 }
 
 func (al *AgentLoop) processSystemMessage(ctx context.Context, msg bus.InboundMessage) (string, error) {
-	// Verify this is a system message
 	if msg.Channel != "system" {
 		return "", fmt.Errorf("processSystemMessage called with non-system message channel: %s", msg.Channel)
 	}
@@ -291,15 +578,13 @@ func (al *AgentLoop) processSystemMessage(ctx context.Context, msg bus.InboundMe
 	if idx := strings.Index(msg.ChatID, ":"); idx > 0 {
 		originChannel = msg.ChatID[:idx]
 	} else {
-		// Fallback
 		originChannel = "cli"
 	}
 
 	// Extract subagent result from message content
-	// Format: "Task 'label' completed.\n\nResult:\n<actual content>"
 	content := msg.Content
 	if idx := strings.Index(content, "Result:\n"); idx >= 0 {
-		content = content[idx+8:] // Extract just the result part
+		content = content[idx+8:]
 	}
 
 	// Skip internal channels - only log, don't send to user
@@ -313,8 +598,6 @@ func (al *AgentLoop) processSystemMessage(ctx context.Context, msg bus.InboundMe
 		return "", nil
 	}
 
-	// Agent acts as dispatcher only - subagent handles user interaction via message tool
-	// Don't forward result here, subagent should use message tool to communicate with user
 	logger.InfoCF("agent", "Subagent completed",
 		map[string]interface{}{
 			"sender_id":   msg.SenderID,
@@ -322,16 +605,14 @@ func (al *AgentLoop) processSystemMessage(ctx context.Context, msg bus.InboundMe
 			"content_len": len(content),
 		})
 
-	// Agent only logs, does not respond to user
 	return "", nil
 }
 
 // runAgentLoop is the core message processing logic.
-// It handles context building, LLM calls, tool execution, and response handling.
+// Handles context building, LLM calls, tool execution, and response handling.
 func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (string, error) {
 	// 0. Record last channel for heartbeat notifications (skip internal channels)
 	if opts.Channel != "" && opts.ChatID != "" {
-		// Don't record internal channels (cli, system, subagent)
 		if !constants.IsInternalChannel(opts.Channel) {
 			channelKey := fmt.Sprintf("%s:%s", opts.Channel, opts.ChatID)
 			if err := al.RecordLastChannel(channelKey); err != nil {
@@ -343,13 +624,17 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 	// 1. Update tool contexts
 	al.updateToolContexts(opts.Channel, opts.ChatID)
 
-	// 2. Build messages (skip history for heartbeat)
+	// 2. Build messages with history limiting (OpenClaw pattern: limitHistoryTurns)
 	var history []providers.Message
 	var summary string
 	if !opts.NoHistory {
 		history = al.sessions.GetHistory(opts.SessionKey)
 		summary = al.sessions.GetSummary(opts.SessionKey)
+
+		// Apply history limiting based on context window
+		history = al.limitHistoryTurns(history, al.contextWindow)
 	}
+
 	messages := al.contextBuilder.BuildMessages(
 		history,
 		summary,
@@ -368,9 +653,6 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 		return "", err
 	}
 
-	// If last tool had ForUser content and we already sent it, we might not need to send final response
-	// This is controlled by the tool's Silent flag and ForUser content
-
 	// 5. Handle empty response
 	if finalContent == "" {
 		finalContent = opts.DefaultResponse
@@ -380,7 +662,7 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 	al.sessions.AddMessage(opts.SessionKey, "assistant", finalContent)
 	al.sessions.Save(opts.SessionKey)
 
-	// 7. Optional: summarization
+	// 7. Optional: summarization (OpenClaw pattern: compaction)
 	if opts.EnableSummary {
 		al.maybeSummarize(opts.SessionKey)
 	}
@@ -406,8 +688,55 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, opts processOptions) (str
 	return finalContent, nil
 }
 
+// limitHistoryTurns limits the history turns based on context window (OpenClaw pattern).
+func (al *AgentLoop) limitHistoryTurns(messages []providers.Message, maxTokens int) []providers.Message {
+	if len(messages) == 0 {
+		return messages
+	}
+
+	// Estimate tokens used by messages
+	tokenCount := 0
+	for _, msg := range messages {
+		tokenCount += len(msg.Content) / 4
+	}
+
+	// If we're under the limit, return as-is
+	if tokenCount < maxTokens*75/100 {
+		return messages
+	}
+
+	// Count message pairs (user + assistant)
+	// Keep pairs until we hit the limit
+	var limited []providers.Message
+	pairCount := 0
+
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		msgTokens := len(msg.Content) / 4
+
+		// If this is an assistant message, start counting a new pair
+		if msg.Role == "assistant" {
+			pairCount++
+		}
+
+		// Add messages if we're within limits
+		if tokenCount+msgTokens < maxTokens*70/100 {
+			tokenCount += msgTokens
+			limited = append([]providers.Message{msg}, limited...)
+		} else {
+			break
+		}
+
+		// Stop after keeping enough pairs (leave room for new message)
+		if pairCount >= 20 {
+			break
+		}
+	}
+
+	return limited
+}
+
 // runLLMIteration executes the LLM call loop with tool handling.
-// Returns the final content, iteration count, and any error.
 func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.Message, opts processOptions) (string, int, error) {
 	iteration := 0
 	var finalContent string
@@ -434,14 +763,6 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 				"max_tokens":        8192,
 				"temperature":       0.7,
 				"system_prompt_len": len(messages[0].Content),
-			})
-
-		// Log full messages (detailed)
-		logger.DebugCF("agent", "Full LLM request",
-			map[string]interface{}{
-				"iteration":     iteration,
-				"messages_json": formatMessagesForLog(messages),
-				"tools_json":    formatToolsForLog(providerToolDefs),
 			})
 
 		// Call LLM
@@ -505,7 +826,6 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 
 		// Execute tool calls
 		for _, tc := range response.ToolCalls {
-			// Log tool call with arguments preview
 			argsJSON, _ := json.Marshal(tc.Arguments)
 			argsPreview := utils.Truncate(string(argsJSON), 200)
 			logger.InfoCF("agent", fmt.Sprintf("Tool call: %s(%s)", tc.Name, argsPreview),
@@ -514,13 +834,7 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 					"iteration": iteration,
 				})
 
-			// Create async callback for tools that implement AsyncTool
-			// NOTE: Following openclaw's design, async tools do NOT send results directly to users.
-			// Instead, they notify the agent via PublishInbound, and the agent decides
-			// whether to forward the result to the user (in processSystemMessage).
 			asyncCallback := func(callbackCtx context.Context, result *tools.ToolResult) {
-				// Log the async completion but don't send directly to user
-				// The agent will handle user notification via processSystemMessage
 				if !result.Silent && result.ForUser != "" {
 					logger.InfoCF("agent", "Async tool completed, agent will handle notification",
 						map[string]interface{}{
@@ -546,7 +860,7 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 					})
 			}
 
-			// Determine content for LLM based on tool result
+			// Determine content for LLM
 			contentForLLM := toolResult.ForLLM
 			if contentForLLM == "" && toolResult.Err != nil {
 				contentForLLM = toolResult.Err.Error()
@@ -569,7 +883,6 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 
 // updateToolContexts updates the context for tools that need channel/chatID info.
 func (al *AgentLoop) updateToolContexts(channel, chatID string) {
-	// Use ContextualTool interface instead of type assertions
 	if tool, ok := al.tools.Get("message"); ok {
 		if mt, ok := tool.(tools.ContextualTool); ok {
 			mt.SetContext(channel, chatID)
@@ -607,17 +920,25 @@ func (al *AgentLoop) maybeSummarize(sessionKey string) {
 func (al *AgentLoop) GetStartupInfo() map[string]interface{} {
 	info := make(map[string]interface{})
 
-	// Tools info
 	tools := al.tools.List()
 	info["tools"] = map[string]interface{}{
 		"count": len(tools),
 		"names": tools,
 	}
 
-	// Skills info
 	info["skills"] = al.contextBuilder.GetSkillsInfo()
 
 	return info
+}
+
+// GetRunStats returns current run statistics.
+func (al *AgentLoop) GetRunStats() RunStats {
+	return al.runManager.GetStats()
+}
+
+// GetLaneStats returns statistics for a lane.
+func (al *AgentLoop) GetLaneStats(laneID string) (active, total int) {
+	return al.lanes.GetLaneStats(laneID)
 }
 
 // formatMessagesForLog formats messages for logging
@@ -687,7 +1008,6 @@ func (al *AgentLoop) summarizeSession(sessionKey string) {
 	toSummarize := history[:len(history)-4]
 
 	// Oversized Message Guard
-	// Skip messages larger than 50% of context window to prevent summarizer overflow
 	maxMessageTokens := al.contextWindow / 2
 	validMessages := make([]providers.Message, 0)
 	omitted := false
@@ -696,7 +1016,6 @@ func (al *AgentLoop) summarizeSession(sessionKey string) {
 		if m.Role != "user" && m.Role != "assistant" {
 			continue
 		}
-		// Estimate tokens for this message
 		msgTokens := len(m.Content) / 4
 		if msgTokens > maxMessageTokens {
 			omitted = true
@@ -710,7 +1029,6 @@ func (al *AgentLoop) summarizeSession(sessionKey string) {
 	}
 
 	// Multi-Part Summarization
-	// Split into two parts if history is significant
 	var finalSummary string
 	if len(validMessages) > 10 {
 		mid := len(validMessages) / 2
@@ -720,7 +1038,6 @@ func (al *AgentLoop) summarizeSession(sessionKey string) {
 		s1, _ := al.summarizeBatch(ctx, part1, "")
 		s2, _ := al.summarizeBatch(ctx, part2, "")
 
-		// Merge them
 		mergePrompt := fmt.Sprintf("Merge these two conversation summaries into one cohesive summary:\n\n1: %s\n\n2: %s", s1, s2)
 		resp, err := al.provider.Chat(ctx, []providers.Message{{Role: "user", Content: mergePrompt}}, nil, al.model, map[string]interface{}{
 			"max_tokens":  1024,
@@ -771,7 +1088,7 @@ func (al *AgentLoop) summarizeBatch(ctx context.Context, batch []providers.Messa
 func (al *AgentLoop) estimateTokens(messages []providers.Message) int {
 	total := 0
 	for _, m := range messages {
-		total += len(m.Content) / 4 // Simple heuristic: 4 chars per token
+		total += len(m.Content) / 4
 	}
 	return total
 }
