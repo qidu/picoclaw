@@ -123,7 +123,14 @@
   },
   "devices": {
     "enabled": false,
-    "monitor_usb": true
+    "monitor_usb": true,
+    "device_type": "auto",
+    "sandbox": {
+      "enabled": false,
+      "no_sandbox": false,
+      "sandbox_type": "none",
+      "auto_detect": true
+    }
   },
   "gateway": {
     "host": "0.0.0.0",

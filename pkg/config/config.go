@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/caarlos0/env/v11"
@@ -157,6 +158,43 @@ type DevicesConfig struct {
 	MonitorUSB  bool                  `json:"monitor_usb" env:"PICOCLAW_DEVICES_MONITOR_USB"`
 	DeviceType  string                `json:"device_type" env:"PICOCLAW_DEVICES_DEVICE_TYPE"` // auto, pi-zero, pi-3, pi-4, phone-8, desktop, server
 	Lanes       LanesConfig           `json:"lanes"`
+	Sandbox    SandboxConfig         `json:"sandbox"`
+}
+
+type SandboxConfig struct {
+	Enabled       bool   `json:"enabled" env:"PICOCLAW_SANDBOX_ENABLED"` // Enable sandbox mode
+	NoSandbox     bool   `json:"no_sandbox" env:"PICOCLAW_SANDBOX_NO_SANDBOX"` // Disable sandbox (for Termux/Android)
+	SandboxType   string `json:"sandbox_type" env:"PICOCLAW_SANDBOX_TYPE"` // "none", "docker", "proot"
+	AutoDetect    bool   `json:"auto_detect" env:"PICOCLAW_SANDBOX_AUTO_DETECT"` // Auto-detect Termux and set NoSandbox=true
+}
+
+// ShouldUseSandbox returns whether sandbox should be used
+// Auto-detects Termux and respects config settings
+func (c *Config) ShouldUseSandbox() bool {
+	// If auto-detect is enabled (default), check for Termux
+	if c.Devices.Sandbox.AutoDetect || c.Devices.Sandbox.AutoDetect {
+		if IsTermux() {
+			return false // Termux doesn't support full sandbox
+		}
+	}
+
+	// Explicit no-sandbox setting
+	if c.Devices.Sandbox.NoSandbox {
+		return false
+	}
+
+	// Explicit sandbox disabled
+	if !c.Devices.Sandbox.Enabled {
+		return false
+	}
+
+	// Sandbox enabled and not Termux
+	return true
+}
+
+// IsTermux returns true if running in Termux environment
+func IsTermux() bool {
+	return strings.Contains(os.Getenv("PREFIX"), "com.termux")
 }
 
 type LanesConfig struct {
@@ -564,10 +602,16 @@ func DefaultConfig() *Config {
 			Interval: 30, // default 30 minutes
 		},
 		Devices: DevicesConfig{
-			Enabled:    false,
-			MonitorUSB: true,
-			DeviceType: "auto",
-			Lanes:      LanesConfig{},
+			Enabled:     false,
+			MonitorUSB:  true,
+			DeviceType:  "auto",
+			Sandbox: SandboxConfig{
+				Enabled:    false,
+				NoSandbox:  false,
+				SandboxType: "none",
+				AutoDetect: true, // Auto-detect Termux and disable sandbox
+			},
+			Lanes: LanesConfig{},
 		},
 	}
 }
