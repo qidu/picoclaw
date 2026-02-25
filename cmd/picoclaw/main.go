@@ -482,6 +482,7 @@ func migrateHelp() {
 func agentCmd() {
 	message := ""
 	sessionKey := "cli:default"
+	logFile := ""
 
 	args := os.Args[2:]
 	for i := 0; i < len(args); i++ {
@@ -489,6 +490,34 @@ func agentCmd() {
 		case "--debug", "-d":
 			logger.SetLevel(logger.DEBUG)
 			fmt.Println("🔍 Debug mode enabled")
+		case "--loglevel", "-l":
+			if i+1 < len(args) {
+				level := strings.ToUpper(args[i+1])
+				i++
+				switch level {
+				case "DEBUG":
+					logger.SetLevel(logger.DEBUG)
+				case "INFO":
+					logger.SetLevel(logger.INFO)
+				case "WARN", "WARNING":
+					logger.SetLevel(logger.WARN)
+				case "ERROR":
+					logger.SetLevel(logger.ERROR)
+				default:
+					fmt.Printf("Unknown log level: %s (valid: DEBUG, INFO, WARN, ERROR)\n", args[i+1])
+				}
+			}
+		case "--logfile", "-f":
+			if i+1 < len(args) {
+				logFile = args[i+1]
+				i++
+				if err := logger.SetLogFile(logFile); err != nil {
+					fmt.Printf("Error setting log file: %v\n", err)
+				} else {
+					logger.SetLogToFileOnly(true)
+					fmt.Printf("📁 Logs → %s (file only)\n", logFile)
+				}
+			}
 		case "-m", "--message":
 			if i+1 < len(args) {
 				message = args[i+1]
@@ -517,14 +546,21 @@ func agentCmd() {
 	msgBus := bus.NewMessageBus()
 	agentLoop := agent.NewAgentLoop(cfg, msgBus, provider)
 
-	// Print agent startup info (only for interactive mode)
-	startupInfo := agentLoop.GetStartupInfo()
-	logger.InfoCF("agent", "Agent initialized",
-		map[string]interface{}{
-			"tools_count":      startupInfo["tools"].(map[string]interface{})["count"],
-			"skills_total":     startupInfo["skills"].(map[string]interface{})["total"],
-			"skills_available": startupInfo["skills"].(map[string]interface{})["available"],
-		})
+	// Print minimal startup info (only in debug or verbose mode)
+	if logger.GetLevel() <= logger.INFO {
+		startupInfo := agentLoop.GetStartupInfo()
+		toolsInfo := startupInfo["tools"].(map[string]interface{})
+		skillsInfo := startupInfo["skills"].(map[string]interface{})
+		fmt.Printf("🦞 PicoClaw v%s | Tools: %d | Skills: %d/%d",
+			formatVersion(),
+			toolsInfo["count"],
+			skillsInfo["available"],
+			skillsInfo["total"])
+		if logFile != "" {
+			fmt.Printf(" | Logs: %s", logFile)
+		}
+		fmt.Println()
+	}
 
 	if message != "" {
 		ctx := context.Background()

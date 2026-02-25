@@ -30,10 +30,12 @@ var (
 		FATAL: "FATAL",
 	}
 
-	currentLevel = INFO
-	logger       *Logger
-	once         sync.Once
-	mu           sync.RWMutex
+	currentLevel  = ERROR  // Default to ERROR (quiet mode)
+	logger        *Logger
+	once          sync.Once
+	mu            sync.RWMutex
+	logFilePath   = ""      // Path to log file
+	logToFileOnly = false   // If true, logs go to file only (not console)
 )
 
 type Logger struct {
@@ -67,22 +69,54 @@ func GetLevel() LogLevel {
 	return currentLevel
 }
 
-func EnableFileLogging(filePath string) error {
+// SetLogFile configures logging to a file.
+// If path is empty, file logging is disabled.
+func SetLogFile(path string) error {
 	mu.Lock()
 	defer mu.Unlock()
 
-	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open log file: %w", err)
-	}
-
+	// Close existing file
 	if logger.file != nil {
 		logger.file.Close()
+		logger.file = nil
 	}
 
-	logger.file = file
-	log.Println("File logging enabled:", filePath)
+	if path != "" {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to open log file: %w", err)
+		}
+		logger.file = file
+		logFilePath = path
+	} else {
+		logFilePath = ""
+	}
 	return nil
+}
+
+// GetLogFile returns the current log file path.
+func GetLogFile() string {
+	mu.RLock()
+	defer mu.RUnlock()
+	return logFilePath
+}
+
+// SetLogToFileOnly controls whether logs go to file only (no console output).
+func SetLogToFileOnly(enabled bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	logToFileOnly = enabled
+}
+
+// IsLogToFileOnly returns true if logging to file only (no console).
+func IsLogToFileOnly() bool {
+	mu.RLock()
+	defer mu.RUnlock()
+	return logToFileOnly
+}
+
+func EnableFileLogging(filePath string) error {
+	return SetLogFile(filePath)
 }
 
 func DisableFileLogging() {
@@ -123,20 +157,23 @@ func logMessage(level LogLevel, component string, message string, fields map[str
 		}
 	}
 
-	var fieldStr string
-	if len(fields) > 0 {
-		fieldStr = " " + formatFields(fields)
+	// Only print to console if NOT in file-only mode
+	if !logToFileOnly {
+		var fieldStr string
+		if len(fields) > 0 {
+			fieldStr = " " + formatFields(fields)
+		}
+
+		logLine := fmt.Sprintf("[%s] [%s]%s %s%s",
+			entry.Timestamp,
+			logLevelNames[level],
+			formatComponent(component),
+			message,
+			fieldStr,
+		)
+
+		log.Println(logLine)
 	}
-
-	logLine := fmt.Sprintf("[%s] [%s]%s %s%s",
-		entry.Timestamp,
-		logLevelNames[level],
-		formatComponent(component),
-		message,
-		fieldStr,
-	)
-
-	log.Println(logLine)
 
 	if level == FATAL {
 		os.Exit(1)
